@@ -1,0 +1,360 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var Gaining_segment = ee.Image("projects/ee-langxihe/assets/Gaining_Merge1");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var DEM = ee.Image("USGS/SRTMGL1_003"),
+    basin = ee.FeatureCollection("projects/ee-langxihe/assets/lxh"),
+    Slope = ee.Image("CSP/ERGo/1_0/US/landforms"),
+    LXRiver = ee.FeatureCollection("projects/ee-langxihe/assets/LXRiver"),
+    GWt = ee.Image("projects/ee-langxihe/assets/GWt"),
+    spring_lxh = ee.FeatureCollection("projects/ee-langxihe/assets/spring_lxh");
+var sample_fishnet=ee.FeatureCollection("projects/ee-langxihe/assets/LRB_sample_fishnet");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+// ------------ STEP.1 PLAIN ------------ //
+var srtm = ee.Image('USGS/SRTMGL1_003').clip(basin); 
+var terrain = ee.Algorithms.Terrain(srtm);
+var elevation = terrain.select('elevation');
+var ele_mean = elevation.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: basin,
+  scale: 30,
+  maxPixels: 30000000000
+});
+var means = ee.Image.constant(ele_mean.values());
+var slope = terrain.select('slope');
+var plain = slope.where(slope.lte(20),1).and(elevation.lte(means));
+var styling_ele = {min:50,max:380,palette:palette_ele};
+var styling_basin = {color:'red',fillColor:'00000000'};
+var styling_river = {color:'blue'};
+var styling_gde = {palette:palette_gde,opacity:0.65,stretch:0.85};
+//Map.addLayer(elevation,styling_ele,'ele')
+Map.addLayer(plain,styling_gde,'plain');
+// ------------ STEP.2 Identify GDEs distribution area ------------ //
+function maskL8sr(image) {
+  var cloudShadowBitMask = (1 << 3);
+  var cloudsBitMask = (1 << 4);
+  var qa = image.select('pixel_qa');
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                 .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask);}
+  
+function normalization(image,region,scale){
+var mean_std = image.reduceRegion({
+  reducer: ee.Reducer.mean()
+            .combine(ee.Reducer.stdDev(),null, true),
+  geometry: region,
+  scale: scale,
+  maxPixels: 10e9,
+}); 
+
+var unitScale = ee.ImageCollection.fromImages(
+  image.bandNames().map(function(name){
+    name = ee.String(name);
+    var band = image.select(name);
+    var mean = ee.Number(mean_std.get(name.cat('_mean')));
+    var std = ee.Number(mean_std.get(name.cat('_stdDev')));
+    var max = mean.add(std.multiply(3));
+    var min = mean.subtract(std.multiply(3));
+    var band1=ee.Image(min).multiply(band.lt(min)).add(ee.Image(max).multiply(band.gt(max)))
+                        .add(band.multiply(ee.Image(1).subtract(band.lt(min)).subtract(band.gt(max))));
+    var result_band = band1.subtract(min).divide(max.subtract(min));
+    return result_band;
+})).toBands().rename(image.bandNames());
+  return unitScale;
+}
+
+function sts_minmax (image){
+    var minmax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry:basin,
+    scale: 30,
+    maxPixels: 1e13}).values();
+    return minmax;}
+
+function NDVI(image){
+  var ndvi=image.expression('(NIR-RED)/(NIR+RED)',{
+    'NIR': image.select('B5'),
+    'RED': image.select('B4')});
+  return ndvi;
+}
+
+function NDWI(image){
+  var ndwi=image.expression('(GREEN-NIR)/(GREEN+NIR)',{
+      'NIR': image.select('B5'),
+      'GREEN': image.select('B3')});
+  return ndwi;
+}
+    
+function NDBSI(image){
+    var ibi = image.expression('(2*SWIR1/(SWIR1+NIR)-(NIR/(NIR+RED)+GREEN/(GREEN+SWIR1)))/(2*SWIR1/(SWIR1+NIR)+(NIR/(NIR+RED)+GREEN/(GREEN+SWIR1)))', {
+      'SWIR1': image.select('B6'),
+      'NIR': image.select('B5'),
+      'RED': image.select('B4'),
+      'GREEN': image.select('B3')});
+    var si = image.expression('((SWIR1+RED)-(NIR+BLUE))/((SWIR1+RED)+(NIR+BLUE))',{
+      'SWIR1':image.select('B6'),
+      'NIR': image.select('B5'),
+      'RED': image.select('B4'),
+      'BLUE': image.select('B2')}) ;
+    var ndbsi1 = (ibi.add(si)).divide(2);
+    var minMax = sts_minmax(ndbsi1);
+    var ndbsi = ndbsi1.unitScale(minMax.get(1),minMax.get(0));
+    return ndbsi;
+}
+    
+function WET(image){
+    var wet1 = image.expression('B*(0.1509)+G*(0.1973)+R*(0.3279)+NIR*(0.3406)+SWIR1*(-0.7112)+SWIR2*(-0.4572)',{ 
+       'B': image.select('B2'),
+       'G': image.select('B3'),
+       'R': image.select('B4'),
+       'NIR': image.select('B5'),
+       'SWIR1': image.select('B6'),
+       'SWIR2': image.select('B7')});
+    var minMax = sts_minmax(wet1);
+    var wet = wet1.unitScale(minMax.get(1),minMax.get(0));
+    return wet;
+}   
+
+function WmW(image1,image2){
+    var w2w_cat = ee.Image.cat([image1,image2]).rename(['b1','b2']);
+    var w2w = w2w_cat.expression('(a-b)/b',{
+        a:w2w_cat.select(['b1']),
+        b:w2w_cat.select(['b2'])});
+    return w2w;
+}
+
+function WmN(image1,image2){
+    var w2n_cat = ee.Image.cat([image1,image2]).rename(['b1','b2']);
+    var w2n = w2n_cat.expression('a-b',{
+        a:w2n_cat.select(['b1']),
+        b:w2n_cat.select(['b2'])});
+    return w2n;
+}
+
+var ls8 = ee.ImageCollection("LANDSAT/LC08/C01/T1_SR").map(maskL8sr);
+var ls8_img = ee.Image(ls8.filterBounds(basin)
+              .filterDate("2021-09-01","2021-10-30").median()).clip(basin);
+var ls8_img2 = ee.Image(ls8.filterBounds(basin)
+              .filterDate("2021-02-15","2021-04-30").median()).clip(basin);
+
+var wet_wet = WET(ls8_img);
+var wet_dry = WET(ls8_img2);
+var ndbsi_wet = NDBSI(ls8_img);
+var ndbsi_dry = NDBSI(ls8_img2);
+var new_index_wet=WmN(wet_wet,ndbsi_wet);
+var new_index_dry=WmN(wet_dry,ndbsi_dry);
+//Map.addLayer(ndbsi_dry,styling_gde,'ndbsi_dry');
+var wet_w2w = WmW(wet_wet,wet_dry);
+var ndbsi_w2w = WmW(ndbsi_wet,ndbsi_dry);
+
+Map.addLayer(wet_w2w,styling_gde,'wet_w2w');
+Map.addLayer(ndbsi_w2w,styling_gde,'ndbsi_w2w');
+Export.image.toDrive({
+  image: wet_w2w,
+  description: 'wet_w2w_lxh',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+Export.image.toDrive({
+  image: ndbsi_w2w,
+  description: 'ndbsi_w2w_lxh',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+
+var w_d = WmN(wet_wet,ndbsi_wet);
+var wd3 = w_d.where(w_d.gte(0.3),1);
+var p01_GDEs = wd3.convolve(ee.Kernel.circle(12.5,'pixels',true));
+
+Map.addLayer(wd3,styling_gde,'wd3');
+
+var wd0 = w_d.where(w_d.gte(0.3),1).and(plain.gte(1)).and(GWt.lte(18.5));
+var P_GDEs = wd0.convolve(ee.Kernel.circle(12.5,'pixels',true));
+
+var wd1 = w_d.where(w_d.gte(0.15),1).and(plain.gte(1)).and(GWt.lte(5));
+var Veg_GDEs = wd1.convolve(ee.Kernel.circle(19.5,'pixels',true));
+
+var wd2 = w_d.where(w_d.gte(0.15),1).and(plain.gte(1))
+  .and(GWt.lte(18.5)).and(Gaining_segment.eq(1));
+var Hy_GDEs = wd2.convolve(ee.Kernel.circle(15.5,'pixels',true));
+// ------------ STEP 3. PLOT & OUTPUT ------------ //
+var palettes = require('users/gena/packages:palettes');
+var palette_gde = palettes.colorbrewer.Blues[9];
+var palette_ele = palettes.kovesi.rainbow_bgyr_35_85_c72[7].slice(1,7);
+var styling_gde = {palette:palette_gde,opacity:0.65,stretch:0.85};
+var styling_ele = {min:50,max:380,palette:palette_ele};
+var styling_basin = {color:'red',fillColor:'00000000'};
+var styling_river = {color:'blue'};
+var palettes = require('users/gena/packages:palettes');
+var palette = palettes.colorbrewer.RdYlGn[9];
+var ltVis = {min:-1,max:1,palette:palette};
+
+//Map.addLayer(new_index_wet,styling_gde,'new_index_wet');
+//Map.addLayer(new_index_dry,styling_gde,'new_index_dry');
+
+Export.image.toDrive({
+  image: wet_wet,
+  description: 'wet_wet',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+
+Export.image.toDrive({
+  image: wet_dry,
+  description: 'wet_dry',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+
+Export.image.toDrive({
+  image: ndbsi_wet,
+  description: 'ndbsi_wet',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+
+Export.image.toDrive({
+  image: ndbsi_dry,
+  description: 'ndbsi_dry',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+
+Map.centerObject(basin,12);
+Map.addLayer(elevation,styling_ele,'Elevation');
+//Map.addLayer(P01_GDEs,styling_gde,'P_GDEs distribution area');
+Map.addLayer(P_GDEs,styling_gde,'P_GDEs distribution area');
+Map.addLayer(Veg_GDEs,styling_gde,'Veg_GDEs distribution area');
+Map.addLayer(Hy_GDEs,styling_gde,'Hy_GDEs distribution area');
+Map.addLayer(w_d,styling_gde,'wd');
+Map.addLayer(basin.style(styling_basin),{},"Langxi River Basin");
+Map.addLayer(LXRiver.style(styling_river).clip(basin),{},"Langxi River");
+
+Export.image.toDrive({
+  image: P_GDEs,
+  description: 'P_GDEs_lxh',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+Export.image.toDrive({
+  image: Veg_GDEs,
+  description: 'Veg_GDEs_lxh',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+Export.image.toDrive({
+  image: Hy_GDEs,
+  description: 'Hy_GDEs_lxh',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+
+// ---------------- Sample_validation -----------//
+Map.centerObject(basin,11);
+//Map.addLayer(sample_fishnet);
+Map.addLayer(basin.style(styling_basin),{},"Langxi River Basin");
+/*
+var l8_dry = ee.Image(ls8.filterBounds(basin)
+              .filterDate("2021-02-01","2021-04-30"));
+print(l8_dry)
+var ndwi_dry = NDWI(l8_dry);
+var ndvi_dry = NDVI(l8_dry);
+
+var l8_wet = ee.Image(ls8.filterBounds(basin)
+              .filterDate("2021-09-01","2021-10-30"));
+var ndwi_wet = NDWI(l8_wet);
+var ndvi_wet = NDVI(l8_wet);
+
+var ndvi_dry = ee.ImageCollection('LANDSAT/LC08/C01/T1_8DAY_NDVI')
+                  .filterDate('2021-03-01', '2021-04-01').filterBounds(basin).median().clip(basin);
+var ndvi_wet = ee.ImageCollection('LANDSAT/LC08/C01/T1_8DAY_NDVI')
+                  .filterDate('2021-09-01', '2021-10-15').filterBounds(basin).median().clip(basin);
+var ndwi_dry = ee.ImageCollection('LANDSAT/LC08/C01/T1_8DAY_NDWI')
+                  .filterDate('2021-03-01', '2021-04-01').filterBounds(basin).median().clip(basin);
+var ndwi_wet = ee.ImageCollection('LANDSAT/LC08/C01/T1_8DAY_NDWI')
+                  .filterDate('2021-09-01', '2021-10-15').filterBounds(basin).median().clip(basin);
+Map.addLayer(ndwi_dry,ltVis,'ndwi_dry');
+Map.addLayer(ndvi_dry,ltVis,'ndvi_day');
+Map.addLayer(ndwi_wet,ltVis,'ndwi_wet');
+Map.addLayer(ndvi_wet,ltVis,'ndvi_wet');
+
+var Datasets =ndvi_dry.addBands([ndvi_wet, ndwi_dry, ndwi_wet])
+  .rename(['ndvi_dry','ndvi_wet','ndwi_dry','ndwi_wet']);
+
+var samples_datasets=Datasets.sampleRegions({
+  collection:sample_fishnet,
+  geometries:true,
+  scale:30
+});
+print('result_extract', samples_datasets);
+
+Export.table.toDrive({
+  collection:samples_datasets,
+  description:'sample_datasets_shp',
+  fileFormat:'SHP',
+});
+
+Export.image.toDrive({
+  image: ndvi_dry,
+  description: 'ndvi_dry',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+Export.image.toDrive({
+  image: ndvi_wet,
+  description: 'ndvi_wet',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+Export.image.toDrive({
+  image: ndwi_dry,
+  description: 'ndwi_dry',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+Export.image.toDrive({
+  image: ndwi_wet,
+  description: 'ndwi_wet',
+  crs: "EPSG:4326",
+  scale: 30,
+  region: basin,
+  maxPixels: 1e13,
+  folder: 'lxh'
+});
+*/
